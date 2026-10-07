@@ -14,6 +14,14 @@ omarchy plugin add https://github.com/Nejcc/omarchy-plugin-probe.git
 omarchy plugin enable nejcc.plugin-probe
 ```
 
+## Uninstall
+
+```sh
+omarchy plugin remove nejcc.plugin-probe
+```
+
+Nothing is left behind. If you stopped `probe ablate` halfway, it has already restored `shell.json` from the copy it took at the start.
+
 ## Usage
 
 - **Bar:** an icon and the shell's RSS. Hover for the shell's CPU and the
