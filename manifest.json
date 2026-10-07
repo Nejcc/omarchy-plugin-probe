@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "nejcc.plugin-probe",
+  "name": "Plugin probe",
+  "version": "0.1.0",
+  "author": "Nejcc",
+  "license": "MIT",
+  "description": "Shows what each shell plugin costs in memory, CPU and helper processes, worst first",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Plugin probe",
+    "description": "Shell RSS in the bar, a ranked table of plugin helper processes in the panel",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

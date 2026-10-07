@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# probe: what each Omarchy shell plugin costs.
+#
+#   probe snapshot [--json] [--sample SECONDS]
+#   probe ablate <plugin-id> [--runs N] [--settle SECONDS] [--yes]
+#
+# snapshot is read-only: two /proc reads and one listPlugins call.
+# ablate restarts your shell several times; only ever run it by hand.
+
+set -euo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROC=${PROBE_PROC:-/proc}
+OMARCHY_PATH=${OMARCHY_PATH:-/usr/share/omarchy}
+CONFIG=$OMARCHY_PATH/shell
+USER_PLUGINS=${PROBE_PLUGINS_DIR:-$HOME/.config/omarchy/plugins}
+SHELL_JSON=${PROBE_SHELL_JSON:-$HOME/.config/omarchy/shell.json}
+
+die() {
+  echo "probe: $*" >&2
+  exit 1
+}
+
+usage() {
+  sed -n '2,9s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"
+}
+
+command -v jq >/dev/null || die "jq is required"
+
+# One line per process: pid ppid ticks rss_kb cwd cmdline, tab separated.
+# Builtins only inside the loop, so a full pass costs two forks, not one per pid.
+sample() {
+  local -A cwd=()
+  local d pid line rest rss cmd page_kb
+  local -a f args
+  page_kb=$(($(getconf PAGESIZE) / 1024))
+  while IFS=$'\t' read -r d line; do
+    cwd[${d##*/}]=$line
+  done < <(find "$PROC"/[0-9]*/cwd -maxdepth 0 -printf '%h\t%l\n' 2>/dev/null || true)
+  for d in "$PROC"/[0-9]*; do
+    pid=${d##*/}
+    { read -r line <"$d/stat" && read -r _ rss _ <"$d/statm"; } 2>/dev/null || continue
+    rest=${line##*) }
+    read -ra f <<<"$rest"
+    args=()
+    mapfile -d '' args 2>/dev/null <"$d/cmdline" || true
+    cmd="${args[*]}"
+    cmd=${cmd//[$'\t\n']/ }
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pid" "${f[1]}" "$((f[11] + f[12]))" "$((rss * page_kb))" "${cwd[$pid]-}" "$cmd"
+  done
+}
+
+# [{id, dirs}] for every plugin on disk: user plugins plus first-party ones.
+plugins_json() {
+  local -a manifests=()
+  local m
+  for m in "$USER_PLUGINS"/*/manifest.json; do [[ -f $m ]] && manifests+=("$m"); done
+  while IFS= read -r m; do manifests+=("$m"); done < <(find "$CONFIG/plugins" -maxdepth 3 -name manifest.json 2>/dev/null || true)
+  ((${#manifests[@]})) || {
+    echo '[]'
+    return
+  }
+  jq -r '[.id, (input_filename | rtrimstr("/manifest.json"))] | @tsv' "${manifests[@]}" 2>/dev/null |
+    while IFS=$'\t' read -r id dir; do
+      # A symlinked or dev-linked plugin shows up under either spelling.
+      printf '%s\t%s\t%s\n' "$id" "$dir" "$(realpath -e "$dir" 2>/dev/null || echo "$dir")"
+    done |
+    jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {id: .[0], dirs: (.[1:] | unique)}) | unique_by(.id)'
+}
+
+enabled_json() {
+  omarchy-shell shell listPlugins 2>/dev/null | jq -c 'map({(.id): .enabled}) | add // {}' 2>/dev/null || echo '{}'
+}
+
+snapshot() {
+  local json=0 secs=1 before after t0 t1 elapsed tmp
+  while (($#)); do
+    case $1 in
+    --json) json=1 ;;
+    --sample)
+      secs=${2:?--sample needs seconds}
+      shift
+      ;;
+    *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+  tmp=$(mktemp -d)
+  before=$tmp/before
+  after=$tmp/after
+  t0=$EPOCHREALTIME
+  sample >"$before"
+  sleep "$secs"
+  t1=$EPOCHREALTIME
+  sample >"$after"
+  elapsed=$(awk -v a="$t0" -v b="$t1" -v s="$secs" 'BEGIN { print (s > 0 ? b - a : 0) }')
+
+  local out
+  out=$(jq -n -f "$HERE/attribute.jq" \
+    --rawfile before "$before" --rawfile after "$after" \
+    --argjson plugins "$(plugins_json)" --argjson enabled "$(enabled_json)" \
+    --arg config "$CONFIG" --argjson hz "$(getconf CLK_TCK)" --argjson elapsed "$elapsed") || out=null
+  rm -rf "$tmp"
+  jq -e '.shell' <<<"$out" >/dev/null || die "no running Omarchy shell (quickshell -p $CONFIG) found"
+
+  if ((json)); then
+    echo "$out"
+    return
+  fi
+  jq -r '"shell pid \(.shell.pid): \(.shell.rssKb / 1024 | round) MB, \(.shell.cpu)% CPU (the QML of every plugin runs in here)\n"' <<<"$out"
+  jq -r '
+    def mb: . / 1024 | . * 10 | round / 10 | tostring + " MB";
+    (["PLUGIN", "ENABLED", "PROCS", "RSS", "CPU%"] | @tsv),
+    (.plugins[] | select(.processes > 0) | [.id, (.enabled // "?" | tostring), .processes, (.rssKb | mb), .cpu] | @tsv),
+    (.unattributed | select(.processes > 0) | ["(other shell children)", "", .processes, (.rssKb | mb), .cpu] | @tsv)
+  ' <<<"$out" | column -t -s $'\t'
+  jq -r '"\n\([.plugins[] | select(.processes == 0 and .enabled == true)] | length) enabled plugins run no helper process; their cost is inside the shell.\nMeasure one with: probe ablate <id>"' <<<"$out"
+}
+
+ping_shell() { omarchy-shell shell ping >/dev/null 2>&1; }
+
+wait_for_shell() {
+  local deadline=$((SECONDS + ${PROBE_READY_TIMEOUT:-60}))
+  until ping_shell; do
+    ((SECONDS < deadline)) || return 1
+    sleep 0.1
+  done
+}
+
+uptime_s() {
+  local up _
+  read -r up _ <"$PROC/uptime"
+  echo "$up"
+}
+
+ablate() {
+  local id="" runs=3 settle=15 yes=0
+  while (($#)); do
+    case $1 in
+    --runs)
+      runs=${2:?--runs needs a number}
+      shift
+      ;;
+    --settle)
+      settle=${2:?--settle needs seconds}
+      shift
+      ;;
+    --yes | -y) yes=1 ;;
+    -*) die "unknown option: $1" ;;
+    *) id=$1 ;;
+    esac
+    shift
+  done
+  [[ -n $id ]] || die "usage: probe ablate <plugin-id> [--runs N] [--settle SECONDS] [--yes]"
+  [[ $runs =~ ^[1-9][0-9]*$ ]] || die "--runs must be a positive integer"
+  [[ $settle =~ ^[0-9]+$ ]] || die "--settle must be whole seconds"
+  command -v omarchy-restart-shell >/dev/null || die "omarchy-restart-shell not found"
+  ping_shell || die "the Omarchy shell is not running"
+
+  local entry original
+  entry=$(omarchy-shell shell listPlugins | jq -c --arg id "$id" '.[] | select(.id == $id)')
+  [[ -n $entry ]] || die "no plugin with id $id (see: omarchy-shell shell listPlugins)"
+  jq -e '.canDisable != false and (.kinds | index("bar") | not)' <<<"$entry" >/dev/null ||
+    die "$id cannot be switched off, so there is nothing to compare against"
+  original=$(jq -r '.enabled' <<<"$entry")
+
+  local minutes=$(((runs * 2 * (settle + 8) + 59) / 60))
+  echo "This restarts your Omarchy shell $((runs * 2 + 1)) times (about $minutes min) to compare it"
+  echo "with and without $id. The bar and panels blink each time. Your shell.json is"
+  echo "backed up first and put back at the end, also on Ctrl+C."
+  if ((!yes)); then
+    [[ -r /dev/tty ]] || die "needs a terminal to confirm; pass --yes to skip"
+    local answer
+    read -r -p "Continue? [y/N] " answer </dev/tty
+    [[ $answer == [yY]* ]] || die "cancelled"
+  fi
+
+  local work had_json=1 touched=0
+  work=$(mktemp -d)
+  if [[ -f $SHELL_JSON ]]; then
+    cp -p "$SHELL_JSON" "$work/original.json" || die "could not back up $SHELL_JSON"
+  else
+    had_json=0
+  fi
+
+  restore() {
+    # A second Ctrl+C must not cut the restore short.
+    trap - EXIT
+    trap '' INT TERM
+    if ((touched)); then
+      echo "Restoring your shell.json and restarting the shell…" >&2
+      if ((had_json)); then cp -p "$work/original.json" "$SHELL_JSON"; else rm -f "$SHELL_JSON"; fi
+      omarchy-restart-shell >/dev/null 2>&1 || true
+      wait_for_shell || echo "probe: the shell did not come back; run omarchy-restart-shell" >&2
+      local now
+      now=$(omarchy-shell shell listPlugins 2>/dev/null | jq -r --arg id "$id" '.[] | select(.id == $id) | .enabled')
+      [[ $now == "$original" ]] || echo "probe: $id is enabled=$now, expected $original; check omarchy plugin list" >&2
+    fi
+    rm -rf "$work"
+  }
+  trap restore EXIT
+  trap 'exit 130' INT TERM
+
+  # Build the flipped shell.json once, through the shell's own IPC, then swap
+  # whole files before each restart. Disabling a bar widget drops it from the
+  # layout, so file swaps are what bring its position and settings back.
+  touched=1
+  if [[ $original == true ]]; then
+    omarchy-shell shell setPluginEnabled "$id" false >/dev/null
+  else
+    omarchy-shell shell enablePlugin "$id" '{}' >/dev/null
+  fi
+  changed() { [[ -f $SHELL_JSON ]] && ! cmp -s "$SHELL_JSON" "$work/original.json"; }
+  local i
+  for ((i = 0; i < 50; i++)); do
+    changed && break
+    sleep 0.1
+  done
+  changed || die "the shell did not record $id as switched; nothing was measured"
+  sleep 0.5 # let the write finish before copying it
+  cp -p "$SHELL_JSON" "$work/flipped.json"
+  local with_json=$work/original.json without_json=$work/flipped.json
+  if [[ $original != true ]]; then
+    with_json=$work/flipped.json
+    without_json=$work/original.json
+  fi
+
+  # One measurement: swap config, restart, time process start -> first ping,
+  # settle, then read shell RSS plus the plugin's own helper processes.
+  measure() {
+    local state=$1 file=$2 ready snap pid start
+    if [[ $file == "$work/original.json" && $had_json == 0 ]]; then rm -f "$SHELL_JSON"; else cp -p "$file" "$SHELL_JSON"; fi
+    omarchy-restart-shell >/dev/null 2>&1 || true
+    wait_for_shell || die "the shell did not come back after a restart"
+    ready=$(uptime_s)
+    sleep "$settle"
+    snap=$(snapshot --json --sample 1)
+    pid=$(jq -r '.shell.pid' <<<"$snap")
+    read -r line <"$PROC/$pid/stat"
+    rest=${line##*) }
+    read -ra f <<<"$rest"
+    start=${f[19]}
+    jq -c --arg state "$state" --arg id "$id" --argjson ready "$ready" --argjson start "$start" --argjson hz "$(getconf CLK_TCK)" '
+      {state: $state, shellKb: .shell.rssKb,
+       helperKb: ([.plugins[] | select(.id == $id) | .rssKb] | add // 0),
+       startupMs: (($ready - $start / $hz) * 1000 | round)}' <<<"$snap"
+  }
+
+  local results=$work/results line rest
+  local -a f
+  for ((i = 1; i <= runs; i++)); do
+    # Alternate the order so slow drift (caches, swap) lands on both sides.
+    if ((i % 2)); then
+      echo "run $i/$runs: with" >&2
+      measure with "$with_json" >>"$results"
+      echo "run $i/$runs: without" >&2
+      measure without "$without_json" >>"$results"
+    else
+      echo "run $i/$runs: without" >&2
+      measure without "$without_json" >>"$results"
+      echo "run $i/$runs: with" >&2
+      measure with "$with_json" >>"$results"
+    fi
+  done
+
+  local report
+  report=$(jq -rs --arg id "$id" -f "$HERE/ablate-report.jq" "$results" | column -t -s $'\t')
+  restore
+  echo
+  echo "$report"
+}
+
+case ${1:-} in
+snapshot)
+  shift
+  snapshot "$@"
+  ;;
+ablate)
+  shift
+  ablate "$@"
+  ;;
+-h | --help | help | "") usage ;;
+*) die "unknown command: $1 (try: probe --help)" ;;
+esac
