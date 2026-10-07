@@ -7,6 +7,8 @@ show (QML running inside the shell itself), `probe ablate` measures the shell
 with and without a plugin and tells you whether the difference is bigger than
 the noise.
 
+![Preview](preview.png)
+
 ## Install
 
 ```sh
